@@ -1,0 +1,1016 @@
+---
+title: "Приложение для игроков в настольные и ролевые
+игры"
+lang: ru
+format:
+  html:
+    toc: false
+    code-copy: true
+    code-overflow: wrap
+
+  pdf:
+    pdf-engine: xelatex
+    mainfont: "DejaVu Serif"
+    sansfont: "DejaVu Sans"
+    monofont: "DejaVu Sans Mono"
+execute:
+  enabled: false
+---
+
+# Задание 1
+
+Каждый зарегистрированный пользователь может:
+
+- искать других пользователей
+- добавлять любого другого пользователя в друзья
+- принимать или отклонять запросы на дружбу.
+- наполнять собственную коллекцию игр (для каждой игры
+указывается название, тип, количество игроков, длительность, текстовое
+описание, изображение).
+- создавать мероприятия (запланированные игры) с указанием названия игры из своей коллекции игр,
+даты и времени начала, адреса и геокоординат, уровня игроков).
+- искать мероприятия со свободными местами по дате/времени, типу,
+геокоординатам, и записываться на них.
+
+Мероприятие, на которое записалось
+меньше игроков, чем указано в его типе, считается не состоявшимся.
+
+Авторизация производится по логину и паролю, подтверждение регистрации и восстановление доступа -- по электронной почте.
+
+## Основные сущности модели
+
+Пользователь, токен подтверждения электронной почты, токен восстановления пароля, запрос в друзья, подтверждённая дружба, тип игры, игра, экземпляр игры в коллекции пользователя, мероприятие и запись пользователя на мероприятие.
+
+## Реализация
+
+1. Учётные записи пользователей вынесены в отдельную таблицу `app_user`, а операции подтверждения email и восстановления пароля реализованы через отдельные таблицы токенов.
+2. Запросы в друзья и подтверждённые дружеские связи разделены на две таблицы: `friend_request` и `friendship`.
+3. Игры представлены как общий каталог `game`, привязка игры к конкретному пользователю выполняется через таблицу `user_game`.
+4. Мероприятие связано не просто с игрой, а с записью `user_game`, чтобы пользователь мог организовать встречу только по игре из собственной коллекции.
+5. Для мероприятий отдельно хранится минимально необходимое число игроков `min_players_required` и максимальная вместимость `max_players_capacity`. Это нужно для проверки условия несостоявшегося мероприятия.
+6. Статусы мероприятий и регистраций заданы через `CHECK`-ограничения. Это упрощает контроль допустимых состояний на уровне базы данных.
+
+## DDL-скрипт
+
+
+```sql
+CREATE SCHEMA IF NOT EXISTS tabletop_app;
+SET search_path TO tabletop_app;
+
+-- Пользователи
+
+CREATE TABLE app_user (
+    user_id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    login                VARCHAR(50)  NOT NULL,
+    email                VARCHAR(255) NOT NULL,
+    password_hash        TEXT         NOT NULL,
+    display_name         VARCHAR(100) NOT NULL,
+    is_active            BOOLEAN      NOT NULL DEFAULT TRUE,
+    email_verified_at    TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_app_user_login UNIQUE (login),
+    CONSTRAINT uq_app_user_email UNIQUE (email)
+);
+
+CREATE INDEX ix_app_user_login ON app_user(login);
+CREATE INDEX ix_app_user_display_name ON app_user(display_name);
+
+-- Подтверждение email
+
+CREATE TABLE email_verification_token (
+    token_id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id              BIGINT       NOT NULL,
+    token_hash           VARCHAR(255) NOT NULL,
+    expires_at           TIMESTAMPTZ  NOT NULL,
+    used_at              TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_email_verification_user
+        FOREIGN KEY (user_id)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT uq_email_verification_token UNIQUE (token_hash)
+);
+
+-- Восстановление пароля
+
+CREATE TABLE password_reset_token (
+    token_id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id              BIGINT       NOT NULL,
+    token_hash           VARCHAR(255) NOT NULL,
+    expires_at           TIMESTAMPTZ  NOT NULL,
+    used_at              TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_password_reset_user
+        FOREIGN KEY (user_id)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT uq_password_reset_token UNIQUE (token_hash)
+);
+
+-- Дружба и запросы в друзья
+
+CREATE TABLE friend_request (
+    friend_request_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    requester_user_id    BIGINT       NOT NULL,
+    addressee_user_id    BIGINT       NOT NULL,
+    status               VARCHAR(20)  NOT NULL DEFAULT 'PENDING',
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    responded_at         TIMESTAMPTZ,
+
+    CONSTRAINT fk_friend_request_requester
+        FOREIGN KEY (requester_user_id)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_friend_request_addressee
+        FOREIGN KEY (addressee_user_id)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_friend_request_users_diff
+        CHECK (requester_user_id <> addressee_user_id),
+
+    CONSTRAINT chk_friend_request_status
+        CHECK (status IN ('PENDING', 'ACCEPTED', 'DECLINED', 'CANCELLED'))
+);
+
+CREATE INDEX ix_friend_request_addressee_status
+    ON friend_request(addressee_user_id, status, created_at DESC);
+
+CREATE UNIQUE INDEX uq_friend_request_pending_pair
+    ON friend_request (
+        LEAST(requester_user_id, addressee_user_id),
+        GREATEST(requester_user_id, addressee_user_id)
+    )
+    WHERE status = 'PENDING';
+
+CREATE TABLE friendship (
+    friendship_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id_1            BIGINT      NOT NULL,
+    user_id_2            BIGINT      NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_friendship_user_1
+        FOREIGN KEY (user_id_1)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_friendship_user_2
+        FOREIGN KEY (user_id_2)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_friendship_order
+        CHECK (user_id_1 < user_id_2),
+
+    CONSTRAINT uq_friendship_pair UNIQUE (user_id_1, user_id_2)
+);
+
+-- Справочник типов игр
+
+CREATE TABLE game_type (
+    game_type_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    type_name            VARCHAR(50) NOT NULL,
+
+    CONSTRAINT uq_game_type_name UNIQUE (type_name)
+);
+
+-- Каталог игр
+
+CREATE TABLE game (
+    game_id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    game_type_id         BIGINT       NOT NULL,
+    title                VARCHAR(200) NOT NULL,
+    players_min          SMALLINT     NOT NULL,
+    players_max          SMALLINT     NOT NULL,
+    duration_minutes     INTEGER      NOT NULL,
+    description          TEXT,
+    image_url            TEXT,
+    created_by_user_id   BIGINT,
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_game_type
+        FOREIGN KEY (game_type_id)
+        REFERENCES game_type(game_type_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_game_created_by
+        FOREIGN KEY (created_by_user_id)
+        REFERENCES app_user(user_id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT chk_game_players
+        CHECK (players_min >= 1 AND players_max >= players_min),
+
+    CONSTRAINT chk_game_duration
+        CHECK (duration_minutes > 0)
+);
+
+CREATE INDEX ix_game_title ON game(title);
+CREATE INDEX ix_game_type ON game(game_type_id);
+
+-- Коллекция игр пользователя
+
+CREATE TABLE user_game (
+    user_game_id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    owner_user_id        BIGINT      NOT NULL,
+    game_id              BIGINT      NOT NULL,
+    added_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active            BOOLEAN     NOT NULL DEFAULT TRUE,
+    notes                TEXT,
+
+    CONSTRAINT fk_user_game_owner
+        FOREIGN KEY (owner_user_id)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_user_game_game
+        FOREIGN KEY (game_id)
+        REFERENCES game(game_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT uq_user_game_owner_game UNIQUE (owner_user_id, game_id),
+    CONSTRAINT uq_user_game_id_owner UNIQUE (user_game_id, owner_user_id)
+);
+
+CREATE INDEX ix_user_game_owner ON user_game(owner_user_id);
+
+-- Мероприятия
+
+CREATE TABLE event (
+    event_id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    organizer_user_id        BIGINT        NOT NULL,
+    user_game_id             BIGINT        NOT NULL,
+    starts_at                TIMESTAMPTZ   NOT NULL,
+    address_text             TEXT          NOT NULL,
+    latitude                 NUMERIC(9,6)  NOT NULL,
+    longitude                NUMERIC(9,6)  NOT NULL,
+    player_level             VARCHAR(20)   NOT NULL DEFAULT 'ANY',
+    min_players_required     SMALLINT      NOT NULL,
+    max_players_capacity     SMALLINT      NOT NULL,
+    status                   VARCHAR(20)   NOT NULL DEFAULT 'OPEN',
+    created_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_event_user_game
+        FOREIGN KEY (user_game_id, organizer_user_id)
+        REFERENCES user_game(user_game_id, owner_user_id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT chk_event_player_level
+        CHECK (player_level IN ('ANY', 'BEGINNER', 'INTERMEDIATE', 'ADVANCED')),
+
+    CONSTRAINT chk_event_status
+        CHECK (status IN ('OPEN', 'FULL', 'CANCELLED', 'NOT_HELD', 'COMPLETED')),
+
+    CONSTRAINT chk_event_players
+        CHECK (
+            min_players_required >= 1
+            AND max_players_capacity >= min_players_required
+        ),
+
+    CONSTRAINT chk_event_latitude
+        CHECK (latitude BETWEEN -90 AND 90),
+
+    CONSTRAINT chk_event_longitude
+        CHECK (longitude BETWEEN -180 AND 180)
+);
+
+CREATE INDEX ix_event_starts_at ON event(starts_at);
+CREATE INDEX ix_event_status ON event(status);
+CREATE INDEX ix_event_lat_lon ON event(latitude, longitude);
+CREATE INDEX ix_event_level ON event(player_level);
+
+-- Запись пользователей на мероприятия
+
+CREATE TABLE event_registration (
+    event_id              BIGINT       NOT NULL,
+    user_id               BIGINT       NOT NULL,
+    status                VARCHAR(20)  NOT NULL DEFAULT 'JOINED',
+    registered_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT pk_event_registration PRIMARY KEY (event_id, user_id),
+
+    CONSTRAINT fk_registration_event
+        FOREIGN KEY (event_id)
+        REFERENCES event(event_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_registration_user
+        FOREIGN KEY (user_id)
+        REFERENCES app_user(user_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_registration_status
+        CHECK (status IN ('JOINED', 'CANCELLED', 'REJECTED', 'WAITLIST'))
+);
+
+CREATE INDEX ix_event_registration_event_status
+    ON event_registration(event_id, status);
+
+CREATE INDEX ix_event_registration_user
+    ON event_registration(user_id);
+```
+
+## Тестовое наполнение
+
+```sql
+SET search_path TO tabletop_app;
+
+INSERT INTO game_type (type_name)
+VALUES
+    ('Board Game'),
+    ('Card Game'),
+    ('TTRPG');
+
+INSERT INTO app_user (
+    login,
+    email,
+    password_hash,
+    display_name,
+    email_verified_at
+)
+VALUES
+    ('alice', 'alice@example.com', 'hash_alice', 'Alice', NOW()),
+    ('bob', 'bob@example.com', 'hash_bob', 'Bob', NOW()),
+    ('carol', 'carol@example.com', 'hash_carol', 'Carol', NOW()),
+    ('dmitry', 'dmitry@example.com', 'hash_dmitry', 'Dmitry', NOW()),
+    ('eva', 'eva@example.com', 'hash_eva', 'Eva', NOW());
+
+INSERT INTO game (
+    game_type_id,
+    title,
+    players_min,
+    players_max,
+    duration_minutes,
+    description,
+    image_url,
+    created_by_user_id
+)
+VALUES
+(
+    (SELECT game_type_id FROM game_type WHERE type_name = 'Board Game'),
+    'Catan',
+    3,
+    4,
+    90,
+    'Economic board game about resource trading and settlement building.',
+    'https://example.com/catan.jpg',
+    (SELECT user_id FROM app_user WHERE login = 'alice')
+),
+(
+    (SELECT game_type_id FROM game_type WHERE type_name = 'Board Game'),
+    'Ticket to Ride',
+    2,
+    5,
+    60,
+    'Railway route-building board game.',
+    'https://example.com/ticket-to-ride.jpg',
+    (SELECT user_id FROM app_user WHERE login = 'eva')
+),
+(
+    (SELECT game_type_id FROM game_type WHERE type_name = 'Card Game'),
+    'Uno',
+    2,
+    10,
+    30,
+    'Fast-paced card game.',
+    'https://example.com/uno.jpg',
+    (SELECT user_id FROM app_user WHERE login = 'carol')
+),
+(
+    (SELECT game_type_id FROM game_type WHERE type_name = 'TTRPG'),
+    'Dungeons & Dragons 5e',
+    4,
+    6,
+    240,
+    'Fantasy tabletop role-playing game.',
+    'https://example.com/dnd5e.jpg',
+    (SELECT user_id FROM app_user WHERE login = 'dmitry')
+),
+(
+    (SELECT game_type_id FROM game_type WHERE type_name = 'Board Game'),
+    'Chess',
+    2,
+    2,
+    45,
+    'Classic strategy board game.',
+    'https://example.com/chess.jpg',
+    (SELECT user_id FROM app_user WHERE login = 'bob')
+);
+
+INSERT INTO user_game (owner_user_id, game_id, notes)
+VALUES
+(
+    (SELECT user_id FROM app_user WHERE login = 'alice'),
+    (SELECT game_id FROM game WHERE title = 'Catan'),
+    'My favorite copy'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'eva'),
+    (SELECT game_id FROM game WHERE title = 'Ticket to Ride'),
+    'European edition'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'carol'),
+    (SELECT game_id FROM game WHERE title = 'Uno'),
+    'Travel version'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'dmitry'),
+    (SELECT game_id FROM game WHERE title = 'Dungeons & Dragons 5e'),
+    'Starter campaign'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'bob'),
+    (SELECT game_id FROM game WHERE title = 'Chess'),
+    'Tournament board'
+);
+
+INSERT INTO event (
+    organizer_user_id,
+    user_game_id,
+    starts_at,
+    address_text,
+    latitude,
+    longitude,
+    player_level,
+    min_players_required,
+    max_players_capacity,
+    status
+)
+VALUES
+(
+    (SELECT user_id FROM app_user WHERE login = 'alice'),
+    (SELECT ug.user_game_id
+     FROM user_game ug
+     JOIN app_user u ON u.user_id = ug.owner_user_id
+     JOIN game g ON g.game_id = ug.game_id
+     WHERE u.login = 'alice' AND g.title = 'Catan'),
+    TIMESTAMPTZ '2026-04-15 18:00:00+03',
+    '12 Main St, Berlin',
+    52.520000,
+    13.405000,
+    'BEGINNER',
+    3,
+    4,
+    'OPEN'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'dmitry'),
+    (SELECT ug.user_game_id
+     FROM user_game ug
+     JOIN app_user u ON u.user_id = ug.owner_user_id
+     JOIN game g ON g.game_id = ug.game_id
+     WHERE u.login = 'dmitry' AND g.title = 'Dungeons & Dragons 5e'),
+    TIMESTAMPTZ '2026-04-15 19:00:00+03',
+    '45 River Rd, Berlin',
+    52.517000,
+    13.388000,
+    'INTERMEDIATE',
+    4,
+    6,
+    'OPEN'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'bob'),
+    (SELECT ug.user_game_id
+     FROM user_game ug
+     JOIN app_user u ON u.user_id = ug.owner_user_id
+     JOIN game g ON g.game_id = ug.game_id
+     WHERE u.login = 'bob' AND g.title = 'Chess'),
+    TIMESTAMPTZ '2026-04-15 17:00:00+03',
+    '8 Park Ave, Berlin',
+    52.510000,
+    13.390000,
+    'ADVANCED',
+    2,
+    2,
+    'OPEN'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'carol'),
+    (SELECT ug.user_game_id
+     FROM user_game ug
+     JOIN app_user u ON u.user_id = ug.owner_user_id
+     JOIN game g ON g.game_id = ug.game_id
+     WHERE u.login = 'carol' AND g.title = 'Uno'),
+    TIMESTAMPTZ '2026-04-16 18:30:00+03',
+    '22 Sunset Blvd, Berlin',
+    52.500000,
+    13.410000,
+    'ANY',
+    2,
+    6,
+    'OPEN'
+),
+(
+    (SELECT user_id FROM app_user WHERE login = 'eva'),
+    (SELECT ug.user_game_id
+     FROM user_game ug
+     JOIN app_user u ON u.user_id = ug.owner_user_id
+     JOIN game g ON g.game_id = ug.game_id
+     WHERE u.login = 'eva' AND g.title = 'Ticket to Ride'),
+    TIMESTAMPTZ '2026-04-15 20:00:00+03',
+    '100 Central Sq, Berlin',
+    52.530000,
+    13.420000,
+    'ANY',
+    2,
+    5,
+    'CANCELLED'
+);
+
+INSERT INTO event_registration (event_id, user_id, status)
+VALUES
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'alice' AND e.starts_at = TIMESTAMPTZ '2026-04-15 18:00:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'bob'),
+    'JOINED'
+),
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'alice' AND e.starts_at = TIMESTAMPTZ '2026-04-15 18:00:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'carol'),
+    'JOINED'
+),
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'dmitry' AND e.starts_at = TIMESTAMPTZ '2026-04-15 19:00:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'alice'),
+    'JOINED'
+),
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'dmitry' AND e.starts_at = TIMESTAMPTZ '2026-04-15 19:00:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'bob'),
+    'JOINED'
+),
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'dmitry' AND e.starts_at = TIMESTAMPTZ '2026-04-15 19:00:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'eva'),
+    'JOINED'
+),
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'dmitry' AND e.starts_at = TIMESTAMPTZ '2026-04-15 19:00:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'carol'),
+    'WAITLIST'
+),
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'bob' AND e.starts_at = TIMESTAMPTZ '2026-04-15 17:00:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'alice'),
+    'JOINED'
+),
+(
+    (SELECT e.event_id
+     FROM event e
+     JOIN app_user u ON u.user_id = e.organizer_user_id
+     WHERE u.login = 'carol' AND e.starts_at = TIMESTAMPTZ '2026-04-16 18:30:00+03'),
+    (SELECT user_id FROM app_user WHERE login = 'eva'),
+    'JOINED'
+);
+```
+
+# Задание 2
+
+Запрос на SQL к БД, спроектированной в задании 1,
+возвращающий таблицу игр на заданную дату, в которых еще есть свободные
+места.
+
+```sql
+SET search_path TO tabletop_app;
+
+SELECT
+    e.event_id,
+    g.title AS game_title,
+    gt.type_name AS game_type,
+    e.starts_at,
+    e.address_text,
+    e.player_level,
+    e.max_players_capacity,
+    1 + COUNT(er.user_id) FILTER (WHERE er.status = 'JOINED') AS occupied_places,
+    e.max_players_capacity - (
+        1 + COUNT(er.user_id) FILTER (WHERE er.status = 'JOINED')
+    ) AS free_places
+FROM event e
+JOIN user_game ug
+    ON ug.user_game_id = e.user_game_id
+JOIN game g
+    ON g.game_id = ug.game_id
+JOIN game_type gt
+    ON gt.game_type_id = g.game_type_id
+LEFT JOIN event_registration er
+    ON er.event_id = e.event_id
+WHERE e.status = 'OPEN'
+  AND e.starts_at::date = DATE '2026-04-15'
+GROUP BY
+    e.event_id,
+    g.title,
+    gt.type_name,
+    e.starts_at,
+    e.address_text,
+    e.player_level,
+    e.max_players_capacity
+HAVING 1 + COUNT(er.user_id) FILTER (WHERE er.status = 'JOINED') < e.max_players_capacity
+ORDER BY e.starts_at, g.title;
+```
+
+## Комментарии к sql-запросу
+Скрипт ищет все открытые игровые события на заданную дату и оставляет только те, в которых ещё есть свободные места.
+
+Запрос собирает данные о событиях из нескольких связанных таблиц. Основная таблица -- `event`, потому что она хранит сами игровые встречи. Через `JOIN` к ней подтягиваются сведения об игре и её типе, а через `LEFT JOIN` -- регистрации участников. `LEFT JOIN` важен, так как он позволяет не потерять события, в которых пока вообще никто не записался.
+
+Затем в `WHERE` отбираются только события со статусом `OPEN` и только на конкретную дату (2026-04-15). После этого данные группируются по каждому событию, чтобы можно было посчитать, сколько участников уже заняли места.
+
+Занятые места считаются как `1 + COUNT(...)` для регистраций со статусом `JOINED`. То есть предполагается, что одно место уже занято организатором, а остальные -- подтверждёнными участниками. Свободные места считаются как разница между максимальной вместимостью и числом занятых мест.
+
+`HAVING` оставляет только те события, где занятых мест меньше, чем вместимость. В итоговую таблицу попадают только игры, на которые ещё можно записаться.
+
+
+
+| ID события | Название игры          | Тип игры   | Дата и время начала        | Адрес                | Уровень игроков | Вместимость | Занято мест | Свободно мест |
+|-----------:|------------------------|------------|----------------------------|----------------------|-----------------|------------:|------------:|---------------:|
+| 1          | Catan                  | Board Game | 2026-04-15 18:00:00+03     | 12 Main St, Berlin   | BEGINNER        | 4           | 3           | 1              |
+| 2          | Dungeons & Dragons 5e  | TTRPG      | 2026-04-15 19:00:00+03     | 45 River Rd, Berlin  | INTERMEDIATE    | 6           | 4           | 2              |
+
+: Результат SQL-запроса для выбранной даты
+
+# Задание 3
+
+Требуется вывести пары игроков, которые когда-либо играли не менее трёх игр одной и той же категории в течение месяца, не будучи друзьями. В запросе учитываются только завершённые мероприятия, а организатор также считается участником игры.
+
+## SQL-запрос
+
+```sql
+SET search_path TO tabletop_app;
+
+WITH event_players AS (
+    -- Организатор тоже считается участником игры
+    SELECT
+        e.event_id,
+        e.starts_at,
+        e.organizer_user_id AS user_id
+    FROM event e
+    WHERE e.status = 'COMPLETED'
+
+    UNION
+
+    -- Остальные участники
+    SELECT
+        e.event_id,
+        e.starts_at,
+        er.user_id
+    FROM event e
+    JOIN event_registration er
+        ON er.event_id = e.event_id
+    WHERE e.status = 'COMPLETED'
+      AND er.status = 'JOINED'
+),
+player_pairs AS (
+    SELECT
+        ep1.event_id,
+        ep1.starts_at,
+        LEAST(ep1.user_id, ep2.user_id) AS user_id_1,
+        GREATEST(ep1.user_id, ep2.user_id) AS user_id_2
+    FROM event_players ep1
+    JOIN event_players ep2
+        ON ep1.event_id = ep2.event_id
+       AND ep1.user_id < ep2.user_id
+),
+pair_games AS (
+    SELECT
+        pp.user_id_1,
+        pp.user_id_2,
+        gt.game_type_id,
+        gt.type_name,
+        date_trunc('month', pp.starts_at)::date AS month_start,
+        pp.event_id
+    FROM player_pairs pp
+    JOIN event e
+        ON e.event_id = pp.event_id
+    JOIN user_game ug
+        ON ug.user_game_id = e.user_game_id
+    JOIN game g
+        ON g.game_id = ug.game_id
+    JOIN game_type gt
+        ON gt.game_type_id = g.game_type_id
+)
+SELECT
+    u1.user_id AS player_1_id,
+    u1.display_name AS player_1,
+    u2.user_id AS player_2_id,
+    u2.display_name AS player_2,
+    pg.type_name AS game_category,
+    pg.month_start,
+    COUNT(*) AS games_together
+FROM pair_games pg
+JOIN app_user u1
+    ON u1.user_id = pg.user_id_1
+JOIN app_user u2
+    ON u2.user_id = pg.user_id_2
+LEFT JOIN friendship f
+    ON f.user_id_1 = pg.user_id_1
+   AND f.user_id_2 = pg.user_id_2
+WHERE f.friendship_id IS NULL
+GROUP BY
+    u1.user_id,
+    u1.display_name,
+    u2.user_id,
+    u2.display_name,
+    pg.type_name,
+    pg.month_start
+HAVING COUNT(*) >= 3
+ORDER BY
+    pg.month_start,
+    pg.type_name,
+    games_together DESC,
+    player_1,
+    player_2;
+```
+
+## Комментарии к sql-запросу
+
+Запрос сначала формирует множество участников завершённых мероприятий: в него включается как организатор, так и пользователи со статусом регистрации `JOINED`. Затем для каждого мероприятия строятся все уникальные пары игроков, после чего к каждой паре привязываются категория игры и месяц проведения мероприятия. На завершающем этапе выполняется группировка по паре игроков, категории и месяцу, отбрасываются пары, для которых существует запись в таблице `friendship`, и выбираются только те случаи, где число совместных игр не меньше трёх.
+
+
+| ID игрока 1 | Игрок 1 | ID игрока 2 | Игрок 2 | Категория игры | Начало месяца | Количество совместных игр |
+|------------:|---------|------------:|---------|----------------|---------------|--------------------------:|
+| 6           | Alice   | 7           | Bob     | Board Game     | 2026-04-01    | 3                         |
+
+: Результат выполнения SQL-запроса
+
+
+# Задание 4
+
+Требуется вывести по каждому пользователю следующие показатели:
+
+- `games_in_collection` — количество игр в коллекции пользователя;
+- `created_completed_events` — количество состоявшихся мероприятий, которые пользователь создал;
+- `joined_not_held_events` — количество мероприятий, на которые пользователь записался, но которые не состоялись.
+
+## SQL-запрос
+
+```sql
+SET search_path TO tabletop_app;
+
+SELECT
+    u.user_id,
+    u.login,
+    u.display_name,
+    COALESCE(ug.games_in_collection, 0) AS games_in_collection,
+    COALESCE(ev.created_completed_events, 0) AS created_completed_events,
+    COALESCE(reg.joined_not_held_events, 0) AS joined_not_held_events
+FROM app_user u
+LEFT JOIN (
+    SELECT
+        owner_user_id,
+        COUNT(*) AS games_in_collection
+    FROM user_game
+    WHERE is_active = TRUE
+    GROUP BY owner_user_id
+) ug
+    ON ug.owner_user_id = u.user_id
+LEFT JOIN (
+    SELECT
+        organizer_user_id,
+        COUNT(*) AS created_completed_events
+    FROM event
+    WHERE status = 'COMPLETED'
+    GROUP BY organizer_user_id
+) ev
+    ON ev.organizer_user_id = u.user_id
+LEFT JOIN (
+    SELECT
+        er.user_id,
+        COUNT(*) AS joined_not_held_events
+    FROM event_registration er
+    JOIN event e
+        ON e.event_id = er.event_id
+    WHERE er.status = 'JOINED'
+      AND e.status = 'NOT_HELD'
+    GROUP BY er.user_id
+) reg
+    ON reg.user_id = u.user_id
+ORDER BY u.user_id;
+```
+
+## Комментарии к sql-запросу
+
+Запрос возвращает по каждому пользователю три агрегированные характеристики:
+
+- `games_in_collection` — количество активных игр в коллекции пользователя;
+- `created_completed_events` — число мероприятий со статусом `COMPLETED`, которые пользователь организовал;
+- `joined_not_held_events` — число мероприятий, на которые пользователь был записан со статусом `JOINED`, но само мероприятие получило статус `NOT_HELD`.
+
+Для расчёта этих показателей используются отдельные подзапросы. Такой подход нужен потому, что при объединении всех таблиц в один большой `JOIN` возникает перемножение строк, из-за чего значения `COUNT(*)` становятся некорректными. Поэтому каждая метрика сначала вычисляется отдельно, а затем присоединяется к таблице `app_user`.
+
+# Задание 5
+
+Имеется таблица T1 со столбцами A,B,C, содержащая 100000 записей.
+Имеется таблица T2 со столбцами X,Y содержащая 10000 записей.
+Созданы B-Tree индексы `T1(B,C)` и `T2(X)`.
+Как будет выполняться запрос:
+
+```sql
+SELECT T1.A, SUM(T2.Y) FROM T1 JOIN T2 ON (T1.A=T2.X) GROUP BY T1.A
+```
+
+Сначала таблица `T2` читается целиком, и по значениям `X` строится временная hash-таблица.
+
+Затем таблица `T1` тоже читается целиком. Для каждой строки `T1` по значению `A` выполняется поиск совпадений в hash-таблице, построенной по `T2.X`.
+
+После соединения строки группируются по `T1.A`, и для каждой группы вычисляется `SUM(T2.Y)`.
+
+План выполнения может выглядеть так:
+
+```
+Seq Scan(T2) -> Hash on X
+Seq Scan(T1) -> Hash Join on T1.A = T2.X
+HashAggregate by T1.A with SUM(T2.Y)
+```
+
+Индекс `T1(B, C)` не подходит для соединения, потому что условие использует `T1.A`, а столбец `A` в этот индекс не входит.
+
+Индекс `T2(X)` формально подходит по полю соединения, но запрос не содержит фильтрации и затрагивает большой объём данных. Поэтому многократные индексные обращения к `T2` обычно менее выгодны, чем один проход по `T2` с построением hash-таблицы.
+
+
+# ER-диаграмма
+
+```{mermaid}
+%%| label: fig-er-diagram
+%%| fig-cap: "ER-диаграмма приложения для настольных и ролевых игр"
+
+erDiagram
+    APP_USER ||--o{ EMAIL_VERIFICATION_TOKEN : has
+    APP_USER ||--o{ PASSWORD_RESET_TOKEN : has
+
+    APP_USER ||--o{ FRIEND_REQUEST : sends
+    APP_USER ||--o{ FRIEND_REQUEST : receives
+
+    APP_USER ||--o{ FRIENDSHIP : user_1
+    APP_USER ||--o{ FRIENDSHIP : user_2
+
+    GAME_TYPE ||--o{ GAME : classifies
+    APP_USER ||--o{ GAME : creates
+    APP_USER ||--o{ USER_GAME : owns
+    GAME ||--o{ USER_GAME : added_to_collection
+
+    APP_USER ||--o{ EVENT : organizes
+    USER_GAME ||--o{ EVENT : used_for_event
+
+    EVENT ||--o{ EVENT_REGISTRATION : has
+    APP_USER ||--o{ EVENT_REGISTRATION : registers
+
+    APP_USER {
+        bigint user_id PK
+        varchar login UK
+        varchar email UK
+        text password_hash
+        varchar display_name
+        boolean is_active
+        timestamptz email_verified_at
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    EMAIL_VERIFICATION_TOKEN {
+        bigint token_id PK
+        bigint user_id FK
+        varchar token_hash UK
+        timestamptz expires_at
+        timestamptz used_at
+        timestamptz created_at
+    }
+
+    PASSWORD_RESET_TOKEN {
+        bigint token_id PK
+        bigint user_id FK
+        varchar token_hash UK
+        timestamptz expires_at
+        timestamptz used_at
+        timestamptz created_at
+    }
+
+    FRIEND_REQUEST {
+        bigint friend_request_id PK
+        bigint requester_user_id FK
+        bigint addressee_user_id FK
+        varchar status
+        timestamptz created_at
+        timestamptz responded_at
+    }
+
+    FRIENDSHIP {
+        bigint friendship_id PK
+        bigint user_id_1 FK
+        bigint user_id_2 FK
+        timestamptz created_at
+    }
+
+    GAME_TYPE {
+        bigint game_type_id PK
+        varchar type_name UK
+    }
+
+    GAME {
+        bigint game_id PK
+        bigint game_type_id FK
+        varchar title
+        smallint players_min
+        smallint players_max
+        integer duration_minutes
+        text description
+        text image_url
+        bigint created_by_user_id FK
+        timestamptz created_at
+    }
+
+    USER_GAME {
+        bigint user_game_id PK
+        bigint owner_user_id FK
+        bigint game_id FK
+        timestamptz added_at
+        boolean is_active
+        text notes
+    }
+
+    EVENT {
+        bigint event_id PK
+        bigint organizer_user_id FK
+        bigint user_game_id FK
+        timestamptz starts_at
+        text address_text
+        numeric latitude
+        numeric longitude
+        varchar player_level
+        smallint min_players_required
+        smallint max_players_capacity
+        varchar status
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    EVENT_REGISTRATION {
+        bigint event_id PK, FK
+        bigint user_id PK, FK
+        varchar status
+        timestamptz registered_at
+        timestamptz updated_at
+    }
+    
+```
+    
+## Кардинальности связей
+
+### Прямые связи 1:N
+
+| № | Связь | Краткое пояснение |
+|---|---|---|
+| 1 | `APP_USER — EMAIL_VERIFICATION_TOKEN` | Один пользователь может иметь несколько токенов подтверждения email |
+| 2 | `APP_USER — PASSWORD_RESET_TOKEN` | Один пользователь может иметь несколько токенов восстановления доступа |
+| 3 | `APP_USER — FRIEND_REQUEST` (как отправитель) | Один пользователь может отправить много запросов в друзья |
+| 4 | `APP_USER — FRIEND_REQUEST` (как получатель) | Один пользователь может получить много запросов в друзья |
+| 5 | `APP_USER — FRIENDSHIP` (как `user_id_1`) | Один пользователь может участвовать во многих записях дружбы |
+| 6 | `APP_USER — FRIENDSHIP` (как `user_id_2`) | Один пользователь может участвовать во многих записях дружбы |
+| 7 | `GAME_TYPE — GAME` | Один тип игры может соответствовать многим играм |
+| 8 | `APP_USER — GAME` | Один пользователь может создать много записей каталога; участие со стороны `GAME` опционально |
+| 9 | `APP_USER — USER_GAME` | Один пользователь может иметь много записей в своей коллекции |
+| 10 | `GAME — USER_GAME` | Одна игра может входить в коллекции многих пользователей |
+| 11 | `USER_GAME — EVENT` | Одна запись коллекции может использоваться для создания многих мероприятий |
+| 12 | `APP_USER — EVENT` | Один пользователь может создать много мероприятий; связь реализована логически через составной внешний ключ |
+| 13 | `EVENT — EVENT_REGISTRATION` | Одно мероприятие может иметь много записей участников |
+| 14 | `APP_USER — EVENT_REGISTRATION` | Один пользователь может иметь много записей на мероприятия |
+
+### Концептуальные связи M:N
+
+| № | Связь | Промежуточная таблица |
+|---|---|---|
+| 1 | `APP_USER — APP_USER` | `FRIEND_REQUEST` |
+| 2 | `APP_USER — APP_USER` | `FRIENDSHIP` |
+| 3 | `APP_USER — GAME` | `USER_GAME` |
+| 4 | `APP_USER — EVENT` | `EVENT_REGISTRATION` |
