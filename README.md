@@ -17,7 +17,6 @@ Database design for a board game / tabletop RPG application with users, friendsh
 
 Each project contains:
 
-- `sql/` — schema, seed data, and query scripts
-- `report/` — report source or rendered report
-- `images/` — diagrams and supporting images
+- `sql/` — ddl script, seed data, and query scripts
+- `report/` — report in html format
 
