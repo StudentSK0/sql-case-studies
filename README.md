@@ -1,6 +1,6 @@
 # SQL Case Studies
 
-A small portfolio of SQL and database design case studies.
+A portfolio of SQL and database design case studies.
 
 ## Projects
 
@@ -20,4 +20,4 @@ Each project contains:
 - `sql/` — schema, seed data, and query scripts
 - `report/` — report source or rendered report
 - `images/` — diagrams and supporting images
-# sql-case-studies
+
