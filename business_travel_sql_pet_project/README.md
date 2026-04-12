@@ -46,8 +46,6 @@ business_travel_sql_pet_project/
 
 ## ER diagram
 
-The repository now includes an ER diagram that shows the main entities, keys, and relationships of the `business_travel` schema.
-
 ![ER diagram of the business_travel schema](images/er_diagram.png)
 
 ## Tech stack
