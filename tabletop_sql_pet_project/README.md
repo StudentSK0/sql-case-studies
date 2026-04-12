@@ -1,23 +1,11 @@
 # Tabletop Event App SQL Database
 
-A portfolio SQL project that models a small application for board game and tabletop RPG players. The database supports user accounts, friendship workflows, personal game collections, event creation, event registration, and analytical queries over completed and scheduled games.
 
-The project is designed as a PostgreSQL schema-first pet project that can be shown in a résumé or portfolio. It demonstrates relational design, integrity constraints, indexing, seed data, and non-trivial SQL queries.
+The project is designed as a PostgreSQL schema-first pet project. It demonstrates relational design, integrity constraints, indexing, seed data, and non-trivial SQL queries.
 
 ## Business scenario
 
 Registered users can discover other players, send and accept friend requests, maintain their own game collections, organize game sessions, and join events with available seats. The system also distinguishes between minimum required players and maximum event capacity, which makes it possible to classify an event as not held when participation is too low.
-
-## Main capabilities
-
-The schema supports:
-- user registration and account lifecycle,
-- email verification and password reset tokens,
-- friend requests and confirmed friendships,
-- a shared game catalog and per-user owned games,
-- event creation only for games that belong to the organizer,
-- participant registration with controlled statuses,
-- reporting queries for availability, repeated co-play patterns, and user-level metrics.
 
 ## Data model
 
@@ -33,15 +21,6 @@ Core entities:
 - `event`
 - `event_registration`
 
-A few design decisions make the model more realistic.
-
-`friend_request` and `friendship` are intentionally separated. This keeps the request workflow independent from the final accepted relationship.
-
-`event` references `user_game`, not only `game`. This guarantees that an organizer can create an event only for a title that exists in their own collection.
-
-`min_players_required` and `max_players_capacity` are stored explicitly in `event`. This allows business logic such as identifying events that were scheduled but did not actually happen because too few players joined.
-
-Status columns are validated with `CHECK` constraints, and several uniqueness rules are enforced directly in the database. This reduces invalid states and makes the schema safer to use from any application layer.
 
 ## Repository structure
 
@@ -69,7 +48,7 @@ This project targets PostgreSQL and uses PostgreSQL-specific features such as:
 - `date_trunc`,
 - tuple foreign keys and integrity checks.
 
-## Getting started
+## Launch
 
 Create a PostgreSQL database and run the scripts in order.
 
@@ -78,7 +57,7 @@ psql -d your_database -f sql/01_schema.sql
 psql -d your_database -f sql/02_seed.sql
 ```
 
-Then run any query from the `sql/queries/` directory, for example:
+Run any query from the `sql/queries/` directory, for example:
 
 ```bash
 psql -d your_database -f sql/queries/01_available_events.sql
@@ -116,15 +95,3 @@ CREATE TABLE event (
 );
 ```
 
-## What this project demonstrates
-
-This repository is useful as a portfolio project because it shows more than basic CRUD. It demonstrates that the author can:
-- translate product requirements into a normalized relational schema,
-- design constraints and indexes deliberately,
-- prepare reproducible seed data,
-- write analytical SQL queries with joins, CTEs, aggregation, filtering, and business rules,
-- structure a small database project in a way that is easy to review on GitHub.
-
-## Possible next improvements
-
-A natural next step is to add an ER diagram, Docker-based startup, and a small API layer or migration tooling such as Flyway or Alembic. That would turn the repository from a database design project into a fuller backend portfolio example.
