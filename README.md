@@ -1,7 +1,7 @@
 
 # SQL Case Studies
-These case studies are intended to show practical SQL and database engineering skills, such as
-* translation of a business scenario into a normalized relational schema
+These case studies show practical SQL and database engineering skills, such as
+* translation of a business scenario into a relational schema
 * development of analytical SQL queries with joins, grouping, filtering, ranking, and date logic
 
 ## Repository structure
